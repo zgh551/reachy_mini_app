@@ -57,6 +57,7 @@ class ReachyMiniXiaobaiApp:
         executor.start()
 
         reachy_mini.media.start_recording()
+        reachy_mini.media.start_playing()
 
         # Wait for microphone
         log.info("Waiting for microphone…")
@@ -111,6 +112,7 @@ class ReachyMiniXiaobaiApp:
                         if "小白" in text:
                             self._respond(reachy_mini, llm, tts, text, motion_queue)
         finally:
+            reachy_mini.media.stop_playing()
             reachy_mini.media.stop_recording()
 
     def _respond(
@@ -123,12 +125,6 @@ class ReachyMiniXiaobaiApp:
     ) -> None:
         """Stream an LLM response, synthesise speech sentence-by-sentence."""
         sentence_buf = ""
-        mini.media.start_playing()
-        # Allow audio pipeline to fully initialize before pushing the first
-        # sample.  push_audio_sample() is non-blocking and the GStreamer
-        # backend (leaky-type=2) silently drops buffers pushed before the
-        # pipeline reaches the PLAYING state.
-        time.sleep(0.2)
         try:
             for token in llm.stream_response(text, motion_queue):
                 sentence_buf += token
@@ -160,7 +156,6 @@ class ReachyMiniXiaobaiApp:
                     )
         finally:
             time.sleep(0.5)
-            mini.media.stop_playing()
 
 
 def main() -> None:
