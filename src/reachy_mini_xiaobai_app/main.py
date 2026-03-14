@@ -36,7 +36,7 @@ VAD_CHUNK_SIZE = 512
 TIMEOUT = 10
 SENTENCE_ENDS = set("。！？.!?")
 
-CHAT_IDLE_TIMEOUT = 10.0  # seconds of silence before leaving chat mode
+CHAT_IDLE_TIMEOUT = 15.0  # seconds of silence before leaving chat mode
 
 KEYWORD = "小白"
 
@@ -88,6 +88,7 @@ class ChatSession:
                 log.info("Chat activated")
             self.state = "CHATTING"
             self.response_id += 1
+            self.last_playback_end = 0.0
             return self.response_id
 
     def deactivate(self) -> None:
@@ -113,7 +114,7 @@ class ChatSession:
         with self._lock:
             if self.state != "CHATTING" or self.last_playback_end == 0.0:
                 return False
-            return time.time() - self.last_playback_end >= CHAT_IDLE_TIMEOUT
+            return (time.time() - self.last_playback_end) >= CHAT_IDLE_TIMEOUT
 
 
 # Tagged item types for the pipeline queues.
