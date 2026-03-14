@@ -9,7 +9,8 @@ import time
 import numpy as np
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
-from reachy_mini_dances_library import RecordedMoves
+from reachy_mini_dances_library import DanceMove
+from reachy_mini_dances_library.collection.dance import AVAILABLE_MOVES
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class MovementExecutor:
         self._mini = mini
         self._queue = motion_queue
         self._stop = stop_event
-        self._recorded_moves = RecordedMoves("pollen-robotics/reachy-mini-dances-library")
+        self._available_moves = AVAILABLE_MOVES
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self) -> None:
@@ -120,13 +121,13 @@ class MovementExecutor:
         time.sleep(0.2)
 
     def _do_emotion(self, cmd: dict) -> None:
-        name = cmd.get("name", "happy")
+        name = cmd.get("name", "simple_nod")
         log.info("emotion: %s", name)
-        move = self._recorded_moves.get(name)
-        if move is not None:
+        if name in self._available_moves:
+            move = DanceMove(name)
             self._mini.play_move(move)
         else:
-            log.warning("Unknown emotion '%s', skipping", name)
+            log.warning("Unknown emotion '%s', available: %s", name, list(self._available_moves.keys()))
 
     def _do_antennas(self, cmd: dict) -> None:
         duration = cmd.get("duration", 1.0)
