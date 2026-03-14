@@ -95,10 +95,37 @@ TOOLS = [
                 "properties": {
                     "name": {
                         "type": "string",
+                        "enum": [
+                            "simple_nod",
+                            "head_tilt_roll",
+                            "side_to_side_sway",
+                            "dizzy_spin",
+                            "stumble_and_recover",
+                            "headbanger_combo",
+                            "interwoven_spirals",
+                            "sharp_side_tilt",
+                            "side_peekaboo",
+                            "yeah_nod",
+                            "uh_huh_tilt",
+                            "neck_recoil",
+                            "chin_lead",
+                            "groovy_sway_and_roll",
+                            "chicken_peck",
+                            "side_glance_flick",
+                            "polyrhythm_combo",
+                            "grid_snap",
+                            "pendulum_swing",
+                            "jackson_square",
+                        ],
                         "description": (
-                            "Emotion name. Available options depend on the robot's "
-                            "emotions library (e.g. 'happy', 'sad', 'surprised', "
-                            "'curious', 'bored', 'excited')."
+                            "Animation name. Choose based on context: "
+                            "agreement/yes→yeah_nod or simple_nod, "
+                            "curious/thinking→head_tilt_roll or side_glance_flick, "
+                            "happy/excited→groovy_sway_and_roll or side_to_side_sway, "
+                            "surprised→neck_recoil or stumble_and_recover, "
+                            "playful→side_peekaboo or chicken_peck, "
+                            "energetic→headbanger_combo or jackson_square, "
+                            "confused→dizzy_spin or pendulum_swing."
                         ),
                     }
                 },
