@@ -264,8 +264,10 @@ class ReachyMiniXiaobaiApp:
             t.start()
 
         try:
-            # Block until shutdown is requested
-            stop_event.wait()
+            # Block until shutdown is requested.  Use a timeout loop so
+            # that KeyboardInterrupt is delivered on Windows.
+            while not stop_event.is_set():
+                stop_event.wait(timeout=1.0)
         finally:
             media.stop_playing()
             media.stop_recording()
