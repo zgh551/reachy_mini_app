@@ -4,6 +4,11 @@ Chinese voice conversation loop with a 4-stage parallel pipeline:
 
     ASR thread ──→ [asr_queue] ──→ LLM thread ──→ [tts_queue] ──→ TTS thread ──→ [audio_queue] ──→ Audio thread
 
+Conversation is activated by the keyword "小白" and stays active until
+10 seconds of silence after the last audio finishes playing.  Saying
+"小白" again while a response is playing interrupts the current output
+and starts a new response.
+
 A background MovementExecutor drives the robot's head and antennas via
 a separate motion_queue populated by the LLM thread.
 """
@@ -31,8 +36,9 @@ VAD_CHUNK_SIZE = 512
 TIMEOUT = 10
 SENTENCE_ENDS = set("。！？.!?")
 
-# Sentinel object to signal end-of-response across queues.
-_END = None
+CHAT_IDLE_TIMEOUT = 10.0  # seconds of silence before leaving chat mode
+
+KEYWORD = "小白"
 
 
 def _find_sentence_end(text: str) -> int:
@@ -43,6 +49,78 @@ def _find_sentence_end(text: str) -> int:
     return -1
 
 
+def _flush_queue(q: queue.Queue) -> None:
+    """Drain all items from a queue without blocking."""
+    while True:
+        try:
+            q.get_nowait()
+            q.task_done()
+        except queue.Empty:
+            break
+
+
+# ---------------------------------------------------------------------------
+# Shared conversation state — accessed by all worker threads
+# ---------------------------------------------------------------------------
+
+
+class ChatSession:
+    """Thread-safe shared state for the conversation pipeline.
+
+    Attributes:
+        state: "IDLE" or "CHATTING"
+        response_id: incremented on each new response; workers discard
+                     items tagged with a stale id.
+        last_playback_end: time.time() when the audio worker finished
+                          playing the last response.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.state: str = "IDLE"
+        self.response_id: int = 0
+        self.last_playback_end: float = 0.0
+
+    def activate(self) -> int:
+        """Enter CHATTING state and bump response_id. Returns new id."""
+        with self._lock:
+            if self.state == "IDLE":
+                log.info("Chat activated")
+            self.state = "CHATTING"
+            self.response_id += 1
+            return self.response_id
+
+    def deactivate(self) -> None:
+        with self._lock:
+            if self.state == "CHATTING":
+                log.info("Chat deactivated (idle timeout)")
+            self.state = "IDLE"
+            self.last_playback_end = 0.0
+
+    def is_chatting(self) -> bool:
+        with self._lock:
+            return self.state == "CHATTING"
+
+    def get_response_id(self) -> int:
+        with self._lock:
+            return self.response_id
+
+    def mark_playback_end(self) -> None:
+        with self._lock:
+            self.last_playback_end = time.time()
+
+    def idle_timeout_exceeded(self) -> bool:
+        with self._lock:
+            if self.state != "CHATTING" or self.last_playback_end == 0.0:
+                return False
+            return time.time() - self.last_playback_end >= CHAT_IDLE_TIMEOUT
+
+
+# Tagged item types for the pipeline queues.
+# Each item carries a response_id so workers can discard stale data.
+_END_TAG = "END"
+
+
 # ---------------------------------------------------------------------------
 # Worker functions — each runs in its own daemon thread
 # ---------------------------------------------------------------------------
@@ -51,9 +129,13 @@ def _find_sentence_end(text: str) -> int:
 def _asr_worker(
     media,
     stop_event: threading.Event,
-    asr_queue: "queue.Queue[str | None]",
+    session: ChatSession,
+    asr_queue: queue.Queue,
+    tts_queue: queue.Queue,
+    audio_queue: queue.Queue,
+    llm_client: LLMClient,
 ) -> None:
-    """Capture audio from the microphone, run VAD + ASR, push text to asr_queue."""
+    """Capture audio, run VAD + ASR, manage chat state, push text to asr_queue."""
     vad = VADStateMachine()
     asr = Qwen3ASR()
 
@@ -79,6 +161,11 @@ def _asr_worker(
     audio_accumulator = np.array([], dtype=np.float32)
 
     while not stop_event.is_set():
+        # Check idle timeout
+        if session.idle_timeout_exceeded():
+            session.deactivate()
+            llm_client.reset_history()
+
         sample = media.get_audio_sample()
         if sample is None:
             time.sleep(0.005)
@@ -102,33 +189,60 @@ def _asr_worker(
             current_time = time.time()
             result = vad.process_chunk(vad_chunk, current_time)
 
-            if result is not None:
-                log.info("Transcribing…")
-                text = asr.transcribe_audio(result, SAMPLE_RATE)
-                log.info("ASR result: %s", text)
+            if result is None:
+                continue
 
-                if "小白" in text:
-                    asr_queue.put(text)
+            log.info("Transcribing…")
+            text = asr.transcribe_audio(result, SAMPLE_RATE)
+            log.info("ASR result: %s", text)
+
+            has_keyword = KEYWORD in text
+
+            if session.is_chatting():
+                if has_keyword:
+                    # Barge-in: interrupt current response
+                    log.info("Barge-in detected, interrupting current response")
+                    _flush_queue(tts_queue)
+                    _flush_queue(audio_queue)
+                    try:
+                        media.clear_player()
+                    except Exception:
+                        log.debug("clear_player not available, skipping")
+
+                rid = session.activate()
+                asr_queue.put((rid, text))
+            elif has_keyword:
+                # First activation
+                llm_client.reset_history()
+                rid = session.activate()
+                asr_queue.put((rid, text))
+            # else: IDLE and no keyword → ignore
 
 
 def _llm_worker(
     stop_event: threading.Event,
-    asr_queue: "queue.Queue[str | None]",
-    tts_queue: "queue.Queue[str | None]",
-    motion_queue: "queue.Queue[dict]",
+    session: ChatSession,
+    asr_queue: queue.Queue,
+    tts_queue: queue.Queue,
+    motion_queue: queue.Queue,
+    llm_client: LLMClient,
 ) -> None:
     """Read user text from asr_queue, stream LLM, split into sentences, push to tts_queue."""
-    llm = LLMClient()
-
     while not stop_event.is_set():
         try:
-            text = asr_queue.get(timeout=0.1)
+            item = asr_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
+        rid, text = item
         sentence_buf = ""
         try:
-            for token in llm.stream_response(text, motion_queue):
+            for token in llm_client.stream_response(text, motion_queue):
+                # Abort if this response has been superseded
+                if session.get_response_id() != rid:
+                    log.info("LLM response %d superseded, aborting", rid)
+                    break
+
                 sentence_buf += token
 
                 while True:
@@ -139,43 +253,49 @@ def _llm_worker(
                     sentence_buf = sentence_buf[end_idx + 1 :]
 
                     if sentence:
-                        log.info("LLM sentence: %s", sentence)
-                        tts_queue.put(sentence)
+                        log.info("LLM sentence [%d]: %s", rid, sentence)
+                        tts_queue.put((rid, sentence))
 
-            # Flush remaining text
-            if sentence_buf.strip():
-                log.info("LLM sentence (flush): %s", sentence_buf.strip())
-                tts_queue.put(sentence_buf.strip())
+            # Flush remaining text (only if not superseded)
+            if session.get_response_id() == rid and sentence_buf.strip():
+                log.info("LLM sentence (flush) [%d]: %s", rid, sentence_buf.strip())
+                tts_queue.put((rid, sentence_buf.strip()))
         except Exception:
             log.exception("Error in LLM streaming")
         finally:
-            tts_queue.put(_END)
+            tts_queue.put((rid, _END_TAG))
             asr_queue.task_done()
 
 
 def _tts_worker(
     stop_event: threading.Event,
-    tts_queue: "queue.Queue[str | None]",
-    audio_queue: "queue.Queue[npt.NDArray[np.float32] | None]",
+    session: ChatSession,
+    tts_queue: queue.Queue,
+    audio_queue: queue.Queue,
 ) -> None:
     """Read sentences from tts_queue, synthesise audio, push to audio_queue."""
     tts = Qwen3TTS()
 
     while not stop_event.is_set():
         try:
-            sentence = tts_queue.get(timeout=0.1)
+            item = tts_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
+        rid, payload = item
         try:
-            if sentence is _END:
-                audio_queue.put(_END)
+            # Discard stale items
+            if session.get_response_id() != rid:
                 continue
 
-            log.info("TTS: %s", sentence)
-            audio_out = tts.synthesize(sentence)
+            if payload is _END_TAG:
+                audio_queue.put((rid, _END_TAG))
+                continue
+
+            log.info("TTS [%d]: %s", rid, payload)
+            audio_out = tts.synthesize(payload)
             if len(audio_out) > 0:
-                audio_queue.put(audio_out)
+                audio_queue.put((rid, audio_out))
         except Exception:
             log.exception("Error in TTS synthesis")
         finally:
@@ -185,24 +305,32 @@ def _tts_worker(
 def _audio_worker(
     media,
     stop_event: threading.Event,
-    audio_queue: "queue.Queue[npt.NDArray[np.float32] | None]",
+    session: ChatSession,
+    audio_queue: queue.Queue,
 ) -> None:
     """Read audio arrays from audio_queue and play them on the speaker."""
     samplerate = media.get_output_audio_samplerate()
 
     while not stop_event.is_set():
         try:
-            audio = audio_queue.get(timeout=0.1)
+            item = audio_queue.get(timeout=0.1)
         except queue.Empty:
             continue
 
+        rid, payload = item
         try:
-            if audio is _END:
-                time.sleep(0.5)
+            # Discard stale items
+            if session.get_response_id() != rid:
                 continue
 
-            media.push_audio_sample(audio)
-            time.sleep(len(audio) / samplerate)
+            if payload is _END_TAG:
+                time.sleep(0.5)
+                session.mark_playback_end()
+                log.debug("Playback finished for response %d, idle timer started", rid)
+                continue
+
+            media.push_audio_sample(payload)
+            time.sleep(len(payload) / samplerate)
         except Exception:
             log.exception("Error in audio playback")
         finally:
@@ -219,19 +347,20 @@ class ReachyMiniXiaobaiApp:
 
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event) -> None:
         """Start all pipeline threads and wait for stop_event."""
-        # Inter-stage queues
-        asr_queue: queue.Queue[str | None] = queue.Queue()
-        tts_queue: queue.Queue[str | None] = queue.Queue(maxsize=5)
-        audio_queue: queue.Queue[npt.NDArray[np.float32] | None] = queue.Queue(maxsize=5)
+        # Inter-stage queues (tagged with response_id)
+        asr_queue: queue.Queue = queue.Queue()
+        tts_queue: queue.Queue = queue.Queue(maxsize=5)
+        audio_queue: queue.Queue = queue.Queue(maxsize=5)
         motion_queue: queue.Queue[dict] = queue.Queue()
+
+        session = ChatSession()
+        llm_client = LLMClient()
 
         media = reachy_mini.media
         media.start_recording()
         media.start_playing()
 
         # Warm up the playback pipeline by pushing a short silent buffer.
-        # This forces GStreamer to fully transition to PLAYING state so the
-        # first real audio sample is not silently dropped.
         silence = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.float32)
         media.push_audio_sample(silence)
         time.sleep(0.2)
@@ -243,25 +372,27 @@ class ReachyMiniXiaobaiApp:
         threads = [
             threading.Thread(
                 target=_asr_worker,
-                args=(media, stop_event, asr_queue),
+                args=(media, stop_event, session, asr_queue, tts_queue,
+                      audio_queue, llm_client),
                 daemon=True,
                 name="asr",
             ),
             threading.Thread(
                 target=_llm_worker,
-                args=(stop_event, asr_queue, tts_queue, motion_queue),
+                args=(stop_event, session, asr_queue, tts_queue,
+                      motion_queue, llm_client),
                 daemon=True,
                 name="llm",
             ),
             threading.Thread(
                 target=_tts_worker,
-                args=(stop_event, tts_queue, audio_queue),
+                args=(stop_event, session, tts_queue, audio_queue),
                 daemon=True,
                 name="tts",
             ),
             threading.Thread(
                 target=_audio_worker,
-                args=(media, stop_event, audio_queue),
+                args=(media, stop_event, session, audio_queue),
                 daemon=True,
                 name="audio",
             ),
@@ -271,8 +402,6 @@ class ReachyMiniXiaobaiApp:
             t.start()
 
         try:
-            # Block until shutdown is requested.  Use a timeout loop so
-            # that KeyboardInterrupt is delivered on Windows.
             while not stop_event.is_set():
                 stop_event.wait(timeout=1.0)
         finally:
