@@ -124,6 +124,11 @@ class ReachyMiniXiaobaiApp:
         """Stream an LLM response, synthesise speech sentence-by-sentence."""
         sentence_buf = ""
         mini.media.start_playing()
+        # Allow audio pipeline to fully initialize before pushing the first
+        # sample.  push_audio_sample() is non-blocking and the GStreamer
+        # backend (leaky-type=2) silently drops buffers pushed before the
+        # pipeline reaches the PLAYING state.
+        time.sleep(0.2)
         try:
             for token in llm.stream_response(text, motion_queue):
                 sentence_buf += token
