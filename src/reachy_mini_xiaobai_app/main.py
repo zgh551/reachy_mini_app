@@ -229,6 +229,13 @@ class ReachyMiniXiaobaiApp:
         media.start_recording()
         media.start_playing()
 
+        # Warm up the playback pipeline by pushing a short silent buffer.
+        # This forces GStreamer to fully transition to PLAYING state so the
+        # first real audio sample is not silently dropped.
+        silence = np.zeros(int(SAMPLE_RATE * 0.1), dtype=np.float32)
+        media.push_audio_sample(silence)
+        time.sleep(0.2)
+
         # Start all workers
         executor = MovementExecutor(reachy_mini, motion_queue, stop_event)
         executor.start()
