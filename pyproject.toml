@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reachy-mini-xiaobai-app"
+version = "0.1.0"
+description = "Chinese voice conversation app (ASR + LLM + TTS + VAD) for Reachy Mini"
+requires-python = ">=3.10"
+dependencies = [
+    "openai",
+    "numpy",
+    "soundfile",
+    "librosa",
+    "httpx",
+    "torch",
+    "silero-vad",
+    "reachy-mini",
+    "python-dotenv",
+    "reachy_mini_dances_library",
+]
+
+[project.entry-points."reachy_mini_apps"]
+xiaobai = "reachy_mini_xiaobai_app.main:ReachyMiniXiaobaiApp"
+
+[project.scripts]
+reachy-mini-xiaobai-app = "reachy_mini_xiaobai_app.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

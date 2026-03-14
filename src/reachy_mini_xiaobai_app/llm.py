@@ -1,10 +1,15 @@
 """OpenAI-compatible LLM client with motion tool definitions."""
 
 import json
+import logging
 import queue
-from typing import Generator, Iterator
+from typing import Generator
 
 from openai import OpenAI
+
+from . import config
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # System prompt — robot persona in Chinese
@@ -130,19 +135,15 @@ class LLMClient:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:8080/v1",
-        api_key: str = "local",
-        model: str = "local-model",
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
     ) -> None:
-        """Initialise the LLM client.
-
-        Args:
-            base_url: Base URL of the OpenAI-compatible server.
-            api_key: API key (any non-empty string works for local servers).
-            model: Model name string to send in requests.
-        """
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
-        self._model = model
+        self._client = OpenAI(
+            base_url=base_url or config.LLM_BASE_URL,
+            api_key=api_key or config.LLM_API_KEY,
+        )
+        self._model = model or config.LLM_MODEL
         self._history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def reset_history(self) -> None:
@@ -159,19 +160,11 @@ class LLMClient:
         Tool calls are parsed eagerly and pushed onto *motion_queue* as they
         arrive.  Text content is yielded token by token so the caller can
         accumulate it into sentences for TTS.
-
-        Args:
-            user_text: Transcribed user utterance.
-            motion_queue: Thread-safe queue for motion command dicts.
-
-        Yields:
-            Text tokens from the assistant response.
         """
         self._history.append({"role": "user", "content": user_text})
 
-        # Accumulate assistant reply for history
         assistant_text = ""
-        tool_calls_raw: dict[int, dict] = {}  # index → partial tool call
+        tool_calls_raw: dict[int, dict] = {}
 
         stream = self._client.chat.completions.create(
             model=self._model,
@@ -187,12 +180,10 @@ class LLMClient:
             if delta is None:
                 continue
 
-            # --- text content ---
             if delta.content:
                 assistant_text += delta.content
                 yield delta.content
 
-            # --- tool calls (streamed incrementally) ---
             if delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
@@ -208,7 +199,6 @@ class LLMClient:
                         if tc.function.arguments:
                             tool_calls_raw[idx]["arguments"] += tc.function.arguments
 
-        # Flush completed tool calls into motion queue
         for idx in sorted(tool_calls_raw):
             tc = tool_calls_raw[idx]
             try:
@@ -217,14 +207,10 @@ class LLMClient:
                 args = {}
             cmd = self._tool_call_to_motion(tc["name"], args)
             if cmd:
+                log.info("Motion command: %s", cmd)
                 motion_queue.put(cmd)
 
-        # Store assistant turn in history
         self._history.append({"role": "assistant", "content": assistant_text})
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _tool_call_to_motion(name: str, args: dict) -> dict | None:
