@@ -37,7 +37,7 @@ class VADStateMachine:
         self.speech_buffer: list[np.ndarray] = []
         self.silence_start_time: float | None = None
         self.speech_start_time: float | None = None
-        self.speech_prob_threshold = 0.5
+        self.speech_prob_threshold = 0.7
         self.vad_model = load_silero_vad()
 
     def process_chunk(self, audio_chunk: np.ndarray, current_time: float) -> np.ndarray | None:

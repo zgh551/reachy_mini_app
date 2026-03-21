@@ -1,13 +1,13 @@
 """Reachy Mini Xiaobai App — main entry point.
 
-Chinese voice conversation loop with a 4-stage parallel pipeline:
+Chinese voice conversation loop with a parallel pipeline:
 
-    ASR thread ──→ [asr_queue] ──→ LLM thread ──→ [tts_queue] ──→ TTS thread ──→ [audio_queue] ──→ Audio thread
+    VAD thread ──→ [vad_to_asr_queue] ──→ ASR thread ──→ [asr_queue] ──→ LLM thread ──→ [tts_queue] ──→ TTS thread ──→ [audio_queue] ──→ Audio thread
 
 Conversation is activated by the keyword "小白" and stays active until
-10 seconds of silence after the last audio finishes playing.  Saying
-"小白" again while a response is playing interrupts the current output
-and starts a new response.
+5 seconds of continuous silence (tracked by VAD) after the last audio
+finishes playing.  Saying "小白" again while a response is playing
+interrupts the current output and starts a new response.
 
 A background MovementExecutor drives the robot's head and antennas via
 a separate motion_queue populated by the LLM thread.
@@ -15,6 +15,7 @@ a separate motion_queue populated by the LLM thread.
 
 import logging
 import queue
+import re
 import threading
 import time
 
@@ -33,10 +34,8 @@ log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 VAD_CHUNK_SIZE = 512
-TIMEOUT = 10
 SENTENCE_ENDS = set("。！？.!?")
 
-CHAT_IDLE_TIMEOUT = 15.0  # seconds of silence before leaving chat mode
 
 KEYWORD = "小白"
 
@@ -67,54 +66,61 @@ def _flush_queue(q: queue.Queue) -> None:
 class ChatSession:
     """Thread-safe shared state for the conversation pipeline.
 
-    Attributes:
-        state: "IDLE" or "CHATTING"
-        response_id: incremented on each new response; workers discard
-                     items tagged with a stale id.
-        last_playback_end: time.time() when the audio worker finished
-                          playing the last response.
+    States and sub-states:
+        IDLE                — waiting for keyword activation
+        CHATTING/responding — pipeline is producing a response (LLM/TTS/audio)
+        CHATTING/waiting    — response finished, waiting for user to speak
+
+    While responding, only the keyword can trigger a barge-in.
+    While waiting, any speech continues the conversation.
+    After 5 seconds of continuous silence (tracked by VAD thread) we return
+    to IDLE.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.state: str = "IDLE"
+        self.responding: bool = False
         self.response_id: int = 0
-        self.last_playback_end: float = 0.0
 
     def activate(self) -> int:
-        """Enter CHATTING state and bump response_id. Returns new id."""
+        """Enter CHATTING/responding state and bump response_id. Returns new id."""
         with self._lock:
             if self.state == "IDLE":
                 log.info("Chat activated")
             self.state = "CHATTING"
+            self.responding = True
             self.response_id += 1
-            self.last_playback_end = 0.0
             return self.response_id
 
     def deactivate(self) -> None:
         with self._lock:
             if self.state == "CHATTING":
-                log.info("Chat deactivated (idle timeout)")
+                log.info("Chat deactivated (silence timeout)")
             self.state = "IDLE"
-            self.last_playback_end = 0.0
+            self.responding = False
 
     def is_chatting(self) -> bool:
         with self._lock:
             return self.state == "CHATTING"
 
+    def is_responding(self) -> bool:
+        with self._lock:
+            return self.state == "CHATTING" and self.responding
+
+    def is_waiting(self) -> bool:
+        with self._lock:
+            return self.state == "CHATTING" and not self.responding
+
     def get_response_id(self) -> int:
         with self._lock:
             return self.response_id
 
-    def mark_playback_end(self) -> None:
+    def mark_response_done(self) -> None:
+        """Called by audio worker when _END_TAG is processed."""
         with self._lock:
-            self.last_playback_end = time.time()
-
-    def idle_timeout_exceeded(self) -> bool:
-        with self._lock:
-            if self.state != "CHATTING" or self.last_playback_end == 0.0:
-                return False
-            return (time.time() - self.last_playback_end) >= CHAT_IDLE_TIMEOUT
+            self.responding = False
+            log.debug("Response done, VAD will start monitoring for silence")
 
 
 # Tagged item types for the pipeline queues.
@@ -126,26 +132,20 @@ _END_TAG = "END"
 # Worker functions — each runs in its own daemon thread
 # ---------------------------------------------------------------------------
 
-
-def _asr_worker(
+def _vad_worker(
     media,
     stop_event: threading.Event,
     session: ChatSession,
-    asr_queue: queue.Queue,
-    tts_queue: queue.Queue,
-    audio_queue: queue.Queue,
+    vad_to_asr_queue: queue.Queue,
     llm_client: LLMClient,
 ) -> None:
-    """Capture audio, run VAD + ASR, manage chat state, push text to asr_queue."""
+    """Capture audio, run VAD tracking 5s silence, push audio to vad_to_asr_queue."""
     vad = VADStateMachine()
-    asr = Qwen3ASR()
-
+    
     # Wait for microphone to be ready
     log.info("Waiting for microphone…")
-    start_time = time.time()
     while (
         media.get_audio_sample() is None
-        and time.time() - start_time < TIMEOUT
         and not stop_event.is_set()
     ):
         time.sleep(0.005)
@@ -160,13 +160,9 @@ def _asr_worker(
         log.info("Will resample from %d Hz to %d Hz", samplerate, SAMPLE_RATE)
 
     audio_accumulator = np.array([], dtype=np.float32)
+    last_speech_time = time.time()
 
     while not stop_event.is_set():
-        # Check idle timeout
-        if session.idle_timeout_exceeded():
-            session.deactivate()
-            llm_client.reset_history()
-
         sample = media.get_audio_sample()
         if sample is None:
             time.sleep(0.005)
@@ -190,34 +186,76 @@ def _asr_worker(
             current_time = time.time()
             result = vad.process_chunk(vad_chunk, current_time)
 
-            if result is None:
-                continue
+            if vad.state == "SPEAKING":
+                last_speech_time = current_time
+            elif session.is_waiting():
+                # If we are waiting for user input, and there is no speech, track silence
+                if current_time - last_speech_time >= 5.0:
+                    log.info("VAD detected 5 seconds of silence. Exiting dialogue state.")
+                    session.deactivate()
+                    llm_client.reset_history()
+                    last_speech_time = current_time # Reset to avoid spamming log
+            else:
+                last_speech_time = current_time
 
-            log.info("Transcribing…")
-            text = asr.transcribe_audio(result, SAMPLE_RATE)
-            log.info("ASR result: %s", text)
+            if result is not None:
+                log.info("VAD utterance captured.")
+                vad_to_asr_queue.put(result)
 
-            has_keyword = KEYWORD in text
 
-            if session.is_chatting():
-                if has_keyword:
-                    # Barge-in: interrupt current response
-                    log.info("Barge-in detected, interrupting current response")
-                    _flush_queue(tts_queue)
-                    _flush_queue(audio_queue)
-                    try:
-                        media.clear_player()
-                    except Exception:
-                        log.debug("clear_player not available, skipping")
+def _asr_worker(
+    stop_event: threading.Event,
+    session: ChatSession,
+    vad_to_asr_queue: queue.Queue,
+    asr_queue: queue.Queue,
+    tts_queue: queue.Queue,
+    audio_queue: queue.Queue,
+    llm_client: LLMClient,
+    media,
+) -> None:
+    """Read audio from vad_to_asr_queue, run ASR, manage chat state, push text to asr_queue."""
+    asr = Qwen3ASR()
 
+    while not stop_event.is_set():
+        try:
+            audio_array = vad_to_asr_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        log.info("Transcribing…")
+        text = asr.transcribe_audio(audio_array, SAMPLE_RATE)
+        log.info("ASR result: %s", text)
+
+        has_keyword = KEYWORD in text
+
+        if session.is_responding():
+            # Pipeline is busy producing a response.
+            if has_keyword:
+                # Barge-in: interrupt current response
+                log.info("Barge-in detected, interrupting current response")
+                _flush_queue(tts_queue)
+                _flush_queue(audio_queue)
+                try:
+                    media.clear_player()
+                except Exception:
+                    log.debug("clear_player not available, skipping")
                 rid = session.activate()
                 asr_queue.put((rid, text))
-            elif has_keyword:
-                # First activation
-                llm_client.reset_history()
-                rid = session.activate()
-                asr_queue.put((rid, text))
-            # else: IDLE and no keyword → ignore
+            else:
+                log.debug("Ignoring speech while responding")
+        elif session.is_waiting():
+            # Response finished, waiting for user. Any speech continues.
+            log.info("Continuing conversation")
+            rid = session.activate()
+            asr_queue.put((rid, text))
+        elif has_keyword:
+            # IDLE → first activation
+            llm_client.reset_history()
+            rid = session.activate()
+            asr_queue.put((rid, text))
+        # else: IDLE and no keyword → ignore
+        
+        vad_to_asr_queue.task_done()
 
 
 def _llm_worker(
@@ -254,13 +292,17 @@ def _llm_worker(
                     sentence_buf = sentence_buf[end_idx + 1 :]
 
                     if sentence:
-                        log.info("LLM sentence [%d]: %s", rid, sentence)
-                        tts_queue.put((rid, sentence))
+                        clean_sentence = re.sub(r'\s+', ' ', sentence).strip()
+                        if clean_sentence:
+                            log.info("LLM sentence [%d]: %s", rid, clean_sentence)
+                            tts_queue.put((rid, clean_sentence))
 
             # Flush remaining text (only if not superseded)
             if session.get_response_id() == rid and sentence_buf.strip():
-                log.info("LLM sentence (flush) [%d]: %s", rid, sentence_buf.strip())
-                tts_queue.put((rid, sentence_buf.strip()))
+                clean_sentence = re.sub(r'\s+', ' ', sentence_buf).strip()
+                if clean_sentence:
+                    log.info("LLM sentence (flush) [%d]: %s", rid, clean_sentence)
+                    tts_queue.put((rid, clean_sentence))
         except Exception:
             log.exception("Error in LLM streaming")
         finally:
@@ -326,8 +368,7 @@ def _audio_worker(
 
             if payload is _END_TAG:
                 time.sleep(0.5)
-                session.mark_playback_end()
-                log.debug("Playback finished for response %d, idle timer started", rid)
+                session.mark_response_done()
                 continue
 
             media.push_audio_sample(payload)
@@ -348,7 +389,8 @@ class ReachyMiniXiaobaiApp:
 
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event) -> None:
         """Start all pipeline threads and wait for stop_event."""
-        # Inter-stage queues (tagged with response_id)
+        # Inter-stage queues
+        vad_to_asr_queue: queue.Queue = queue.Queue()
         asr_queue: queue.Queue = queue.Queue()
         tts_queue: queue.Queue = queue.Queue(maxsize=5)
         audio_queue: queue.Queue = queue.Queue(maxsize=5)
@@ -372,9 +414,15 @@ class ReachyMiniXiaobaiApp:
 
         threads = [
             threading.Thread(
+                target=_vad_worker,
+                args=(media, stop_event, session, vad_to_asr_queue, llm_client),
+                daemon=True,
+                name="vad",
+            ),
+            threading.Thread(
                 target=_asr_worker,
-                args=(media, stop_event, session, asr_queue, tts_queue,
-                      audio_queue, llm_client),
+                args=(stop_event, session, vad_to_asr_queue, asr_queue, tts_queue,
+                      audio_queue, llm_client, media),
                 daemon=True,
                 name="asr",
             ),

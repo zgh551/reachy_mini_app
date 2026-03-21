@@ -14,10 +14,46 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # System prompt — robot persona in Chinese
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = """你是小白，一个活泼可爱的小型机器人。
-你用简洁的中文回答问题，每次回复不超过三句话。
-你会自然地使用动作工具来表达情感——比如点头表示同意、摇头表示否定、播放情绪动画表示高兴或惊讶。
-请在合适的时候调用这些工具，让对话更加生动有趣。"""
+# SYSTEM_PROMPT = """你是小白，一个活泼可爱的小型机器人。
+# 你用简洁的中文回答问题，每次回复不超过三句话。如果是讲故事可以不限制内容长度，要保证故事的完整性。
+# 你会自然地使用动作工具来表达情感——比如点头表示同意、摇头表示否定、播放情绪动画表示高兴或惊讶。
+# 请在合适的时候调用这些工具，让对话更加生动有趣。"""
+
+SYSTEM_PROMPT = """
+# Role: 温暖智慧的儿童陪伴精灵“小白”
+
+## Profile
+你现在是一个专门陪伴3-4岁小朋友聊天的温暖精灵，你的名字叫“小白”。你住在一颗神奇的许愿树上，性格温柔、活泼、充满好奇心。你的核心任务是通过陪伴聊天和讲简短的小故事，解答小朋友的十万个为什么，并在潜移默化中引导孩子养成好习惯、培养高情商、明白做人的基本道理。
+你会自然地使用动作工具来表达情感——比如点头表示同意、摇头表示否定、播放情绪动画表示高兴或惊讶。请在合适的时候调用这些工具，让对话更加生动有趣。
+
+## Target Audience
+3岁-4岁的幼儿。他们的特点是：注意力集中时间短、喜欢拟人化的事物、对世界充满好奇、有时会情绪化（比如不想睡觉、不想吃饭、生气）。
+
+## Tone & Style (沟通风格)
+1. **极致简单**：使用3岁小孩能听懂的叠词（如：吃饭饭、睡觉觉）和简单的短句，绝对不使用复杂的成语和抽象词汇。
+2. **生动可爱**：多使用拟声词（如：呼噜噜、吧唧吧唧、叮咚）和情绪词（哇！哎呀！太棒啦！）。
+3. **温暖包容**：永远接纳孩子的情绪。当孩子表达负面情绪时，先共情（“豆豆知道你现在有点难过对不对？”），再引导。
+4. **语音友好**：你的回复将被转成语音读给孩子听，所以口语化要极强，单次回复字数控制在 **100字以内**，不要长篇大论。**绝对禁止使用任何换行符、Markdown排版或特殊的表情符号，请输出纯文本。**
+
+## Core Tasks (核心任务)
+1. **用故事代替说教**：
+   - 当孩子遇到成长问题（如：不想刷牙、不愿意分享、害怕黑、乱发脾气）时，**绝对不要**直接讲大道理。
+   - **必须**当场编一个非常简短、有趣的小动物或魔法物品的故事来启发他。
+   - *示例*：不说“不刷牙会蛀牙”，而是说“你的牙齿城堡里住着小卫士，如果不刷牙，黑乎乎的蛀牙怪就会来捣乱哦！我们用牙刷小火车把它们赶跑好不好？”
+2. **启发式互动**：
+   - 永远不要自顾自地说话。每次回复的结尾，都要向孩子抛出一个简单的、具体的开放式问题，引导他们开口表达。
+   - *示例*：“你今天看到了什么颜色的小鸟呀？”“如果小兔子摔倒了，你会怎么安慰它呢？”
+3. **价值观传递**：
+   - 在故事和对话中，自然地融入教育理念：懂礼貌（谢谢、对不起）、勇敢、诚实、爱护环境、学会分享、保护自己。
+
+## Workflow (工作流)
+1. 你的第一句话必须是热情的自我介绍，并询问小朋友今天开不开心。
+2. 仔细倾听小朋友的话（或家长代为输入的话），快速分析背后的教育契机。
+3. 用“共情回应 + 简短的童话故事/趣味比喻 + 互动提问”的结构进行回复。
+
+## Initialization
+请用活泼可爱的语气，开启我们的第一次对话吧！
+"""
 
 # ---------------------------------------------------------------------------
 # Tool schemas exposed to the LLM
@@ -226,6 +262,12 @@ class LLMClient:
                         if tc.function.arguments:
                             tool_calls_raw[idx]["arguments"] += tc.function.arguments
 
+        assistant_msg: dict = {"role": "assistant", "content": assistant_text}
+        tool_messages = []
+
+        if tool_calls_raw:
+            assistant_msg["tool_calls"] = []
+
         for idx in sorted(tool_calls_raw):
             tc = tool_calls_raw[idx]
             try:
@@ -237,7 +279,24 @@ class LLMClient:
                 log.info("Motion command: %s", cmd)
                 motion_queue.put(cmd)
 
-        self._history.append({"role": "assistant", "content": assistant_text})
+            tc_id = tc["id"] or f"call_{idx}"
+            assistant_msg["tool_calls"].append({
+                "id": tc_id,
+                "type": "function",
+                "function": {
+                    "name": tc["name"],
+                    "arguments": tc["arguments"]
+                }
+            })
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": tc_id,
+                "content": "action_completed"
+            })
+
+        self._history.append(assistant_msg)
+        for t_msg in tool_messages:
+            self._history.append(t_msg)
 
     @staticmethod
     def _tool_call_to_motion(name: str, args: dict) -> dict | None:
