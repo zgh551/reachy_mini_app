@@ -217,6 +217,7 @@ class LLMClient:
         self,
         user_text: str,
         motion_queue: "queue.Queue[dict]",
+        frame = None,
     ) -> Generator[str, None, None]:
         """Send a user message and stream text tokens back.
 
@@ -224,7 +225,37 @@ class LLMClient:
         arrive.  Text content is yielded token by token so the caller can
         accumulate it into sentences for TTS.
         """
-        self._history.append({"role": "user", "content": user_text})
+        message_content = []
+        if frame is not None:
+            import cv2
+            import base64
+            
+            # 等比例缩放至720P以减小LLM负载
+            height, width = frame.shape[:2]
+            if height > 720:
+                scale = 720.0 / height
+                new_width = int(width * scale)
+                frame = cv2.resize(frame, (new_width, 720), interpolation=cv2.INTER_AREA)
+
+            success, buffer = cv2.imencode('.jpg', frame)
+            if success:
+                b64_str = base64.b64encode(buffer).decode('utf-8')
+                message_content.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{b64_str}"
+                    }
+                })
+        
+        message_content.append({
+            "type": "text",
+            "text": user_text
+        })
+
+        if len(message_content) == 1:
+            self._history.append({"role": "user", "content": user_text})
+        else:
+            self._history.append({"role": "user", "content": message_content})
 
         assistant_text = ""
         tool_calls_raw: dict[int, dict] = {}

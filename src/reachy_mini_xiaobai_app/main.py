@@ -40,6 +40,19 @@ SENTENCE_ENDS = set("。！？.!?")
 KEYWORD = "小白"
 
 
+def _generate_ding(sr: int = 16000) -> np.ndarray:
+    """Generate a gentle double-chime notification sound (float32 array)."""
+    t1 = np.linspace(0, 0.15, int(sr * 0.15), endpoint=False)
+    tone1 = 0.3 * np.sin(2 * np.pi * 880 * t1) * np.exp(-10 * t1)
+    
+    t2 = np.linspace(0, 0.3, int(sr * 0.3), endpoint=False)
+    tone2 = 0.3 * np.sin(2 * np.pi * 1108.73 * t2) * np.exp(-10 * t2)
+    
+    return np.concatenate([tone1, tone2]).astype(np.float32)
+
+NOTIFICATION_SOUND = _generate_ding(SAMPLE_RATE)
+
+
 def _find_sentence_end(text: str) -> int:
     """Return the index of the first sentence-ending punctuation, or -1."""
     for i, ch in enumerate(text):
@@ -226,6 +239,15 @@ def _asr_worker(
         text = asr.transcribe_audio(audio_array, SAMPLE_RATE)
         log.info("ASR result: %s", text)
 
+        frame = None
+        try:
+            if hasattr(media, "get_frame"):
+                frame = media.get_frame()
+                if frame is not None:
+                    log.info("Captured camera frame for vision.")
+        except Exception as e:
+            log.warning("Failed to get frame: %s", e)
+
         has_keyword = KEYWORD in text
 
         if session.is_responding():
@@ -240,19 +262,22 @@ def _asr_worker(
                 except Exception:
                     log.debug("clear_player not available, skipping")
                 rid = session.activate()
-                asr_queue.put((rid, text))
+                audio_queue.put((rid, NOTIFICATION_SOUND))
+                asr_queue.put((rid, text, frame))
             else:
                 log.debug("Ignoring speech while responding")
         elif session.is_waiting():
             # Response finished, waiting for user. Any speech continues.
             log.info("Continuing conversation")
             rid = session.activate()
-            asr_queue.put((rid, text))
+            audio_queue.put((rid, NOTIFICATION_SOUND))
+            asr_queue.put((rid, text, frame))
         elif has_keyword:
             # IDLE → first activation
             llm_client.reset_history()
             rid = session.activate()
-            asr_queue.put((rid, text))
+            audio_queue.put((rid, NOTIFICATION_SOUND))
+            asr_queue.put((rid, text, frame))
         # else: IDLE and no keyword → ignore
         
         vad_to_asr_queue.task_done()
@@ -273,10 +298,15 @@ def _llm_worker(
         except queue.Empty:
             continue
 
-        rid, text = item
+        if len(item) == 2:
+            rid, text = item
+            frame = None
+        else:
+            rid, text, frame = item
+
         sentence_buf = ""
         try:
-            for token in llm_client.stream_response(text, motion_queue):
+            for token in llm_client.stream_response(text, motion_queue, frame=frame):
                 # Abort if this response has been superseded
                 if session.get_response_id() != rid:
                     log.info("LLM response %d superseded, aborting", rid)
