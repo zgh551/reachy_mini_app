@@ -85,38 +85,41 @@ class MovementExecutor:
     def _do_nod(self, cmd: dict) -> None:
         times = cmd.get("times", 1)
         log.info("nod ×%d", times)
-        nod_angle = math.radians(15)
+        # 延长到 0.5秒 单程，确保系统底层插值能走完全程
+        duration = 0.25 
         for _ in range(times):
+            # 1. 明显低头：我们让它下压约 30 度
             self._mini.goto_target(
-                head=create_head_pose(roll=0, pitch=-nod_angle, yaw=0), duration=0.25
+                head=create_head_pose(roll=0, pitch=20, yaw=0, degrees=True), duration=duration
             )
-            time.sleep(0.25)
+            time.sleep(duration)
+            # 2. 轻微仰头：抬起一点点，-15度
             self._mini.goto_target(
-                head=create_head_pose(roll=0, pitch=nod_angle, yaw=0), duration=0.25
+                head=create_head_pose(roll=0, pitch=-10, yaw=0, degrees=True), duration=duration
             )
-            time.sleep(0.25)
-        # Return to neutral
+            time.sleep(duration)
+        # 3. 恢复正脸中位
         self._mini.goto_target(
-            head=create_head_pose(roll=0, pitch=0, yaw=0), duration=0.2
+            head=create_head_pose(roll=0, pitch=0, yaw=0, degrees=True), duration=duration
         )
-        time.sleep(0.2)
+        time.sleep(duration)
 
     def _do_shake(self, cmd: dict) -> None:
         times = cmd.get("times", 1)
         log.info("shake ×%d", times)
-        shake_angle = math.radians(20)
+        shake_angle = 30
         for _ in range(times):
             self._mini.goto_target(
-                head=create_head_pose(roll=0, pitch=0, yaw=-shake_angle), duration=0.2
+                head=create_head_pose(roll=0, pitch=0, yaw=-shake_angle, degrees=True), duration=0.2
             )
             time.sleep(0.2)
             self._mini.goto_target(
-                head=create_head_pose(roll=0, pitch=0, yaw=shake_angle), duration=0.2
+                head=create_head_pose(roll=0, pitch=0, yaw=shake_angle, degrees=True), duration=0.2
             )
             time.sleep(0.2)
         # Return to neutral
         self._mini.goto_target(
-            head=create_head_pose(roll=0, pitch=0, yaw=0), duration=0.2
+            head=create_head_pose(roll=0, pitch=0, yaw=0, degrees=True), duration=0.2
         )
         time.sleep(0.2)
 

@@ -9,7 +9,7 @@ from silero_vad import load_silero_vad
 log = logging.getLogger(__name__)
 
 # VAD parameters
-SILENCE_THRESHOLD = 1.5    # seconds of silence before treating speech as finished
+SILENCE_THRESHOLD = 1.2    # seconds of silence before treating speech as finished
 MIN_SPEECH_DURATION = 0.3  # discard segments shorter than this (noise)
 MAX_SPEECH_DURATION = 30   # force-flush after this many seconds
 
@@ -37,7 +37,7 @@ class VADStateMachine:
         self.speech_buffer: list[np.ndarray] = []
         self.silence_start_time: float | None = None
         self.speech_start_time: float | None = None
-        self.speech_prob_threshold = 0.7
+        self.speech_prob_threshold = 0.6
         self.vad_model = load_silero_vad()
 
     def process_chunk(self, audio_chunk: np.ndarray, current_time: float) -> np.ndarray | None:

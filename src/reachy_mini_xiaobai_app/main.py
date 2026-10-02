@@ -239,15 +239,6 @@ def _asr_worker(
         text = asr.transcribe_audio(audio_array, SAMPLE_RATE)
         log.info("ASR result: %s", text)
 
-        frame = None
-        try:
-            if hasattr(media, "get_frame"):
-                frame = media.get_frame()
-                if frame is not None:
-                    log.info("Captured camera frame for vision.")
-        except Exception as e:
-            log.warning("Failed to get frame: %s", e)
-
         has_keyword = KEYWORD in text
 
         if session.is_responding():
@@ -263,7 +254,7 @@ def _asr_worker(
                     log.debug("clear_player not available, skipping")
                 rid = session.activate()
                 audio_queue.put((rid, NOTIFICATION_SOUND))
-                asr_queue.put((rid, text, frame))
+                asr_queue.put((rid, text))
             else:
                 log.debug("Ignoring speech while responding")
         elif session.is_waiting():
@@ -271,13 +262,13 @@ def _asr_worker(
             log.info("Continuing conversation")
             rid = session.activate()
             audio_queue.put((rid, NOTIFICATION_SOUND))
-            asr_queue.put((rid, text, frame))
+            asr_queue.put((rid, text))
         elif has_keyword:
             # IDLE → first activation
             llm_client.reset_history()
             rid = session.activate()
             audio_queue.put((rid, NOTIFICATION_SOUND))
-            asr_queue.put((rid, text, frame))
+            asr_queue.put((rid, text))
         # else: IDLE and no keyword → ignore
         
         vad_to_asr_queue.task_done()
@@ -290,6 +281,7 @@ def _llm_worker(
     tts_queue: queue.Queue,
     motion_queue: queue.Queue,
     llm_client: LLMClient,
+    media,
 ) -> None:
     """Read user text from asr_queue, stream LLM, split into sentences, push to tts_queue."""
     while not stop_event.is_set():
@@ -300,13 +292,23 @@ def _llm_worker(
 
         if len(item) == 2:
             rid, text = item
-            frame = None
         else:
-            rid, text, frame = item
+            rid, text, _ = item
 
+        def get_frame():
+            try:
+                if hasattr(media, "get_frame"):
+                    f = media.get_frame()
+                    if f is not None:
+                        log.info("Captured camera frame for vision tool.")
+                    return f
+            except Exception as e:
+                log.warning("Failed to get frame: %s", e)
+            return None
+        log.info(f"the asr text: {text}")
         sentence_buf = ""
         try:
-            for token in llm_client.stream_response(text, motion_queue, frame=frame):
+            for token in llm_client.stream_response(text, motion_queue, get_frame_callback=get_frame):
                 # Abort if this response has been superseded
                 if session.get_response_id() != rid:
                     log.info("LLM response %d superseded, aborting", rid)
@@ -459,7 +461,7 @@ class ReachyMiniXiaobaiApp:
             threading.Thread(
                 target=_llm_worker,
                 args=(stop_event, session, asr_queue, tts_queue,
-                      motion_queue, llm_client),
+                      motion_queue, llm_client, media),
                 daemon=True,
                 name="llm",
             ),

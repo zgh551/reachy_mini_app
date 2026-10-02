@@ -130,6 +130,9 @@ def run_tts_generation(args) -> None:
     }
 
     with httpx.Client(timeout=300.0) as client:
+        print(api_url)
+        print(payload)
+        print(headers)
         response = client.post(api_url, json=payload, headers=headers)
 
     if response.status_code != 200:
@@ -186,7 +189,7 @@ def parse_args():
         "--model",
         "-m",
         type=str,
-        default="./Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        default="Qwen3-TTS-12Hz-1.7B-VoiceDesign",
         help="Model name/path",
     )
 
