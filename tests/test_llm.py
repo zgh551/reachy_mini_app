@@ -5,7 +5,7 @@ client = OpenAI(
     api_key="not-needed",
 )
 
-SYSTEM_PROMPT = """你是小扬白，一个活泼可爱的小型机器人。
+SYSTEM_PROMPT = """你是小白，一个活泼可爱的小型机器人。
 你用简洁的中文回答问题，每次回复不超过三句话。
 你会自然地使用动作工具来表达情感——比如点头表示同意、摇头表示否定、播放情绪动画表示高兴或惊讶。
 请在合适的时候调用这些工具，让对话更加生动有趣。"""
@@ -120,18 +120,32 @@ TOOLS = [
 stream = client.chat.completions.create(
     model="./Qwen3-ASR-1.7B/",
     messages=_history,
-    tools=TOOLS,
     stream=True,
+    max_tokens=32768,
     temperature=0.7,
-    max_tokens=512,
+    top_p=0.8,
+    presence_penalty=1.5,
+    extra_body={
+        "top_k": 20,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }, 
 )
 
+is_thinking_done = False
 for chunk in stream:
+    # print(chunk)
     delta = chunk.choices[0].delta if chunk.choices else None
     if delta is None:
         continue
-    else:
-        print(delta.content)
+
+    # 2. 打印正式回答 (content)
+    if delta.content:
+        # 当第一次遇到 content 时，说明思考结束，换行打印正式回答
+        if not is_thinking_done:
+            print("\n\n【正式回答】:", end="")
+            is_thinking_done = True
+            
+        print(delta.content, end="", flush=True)
     # --- text content ---
     # if delta.content:
     #     assistant_text += delta.content
