@@ -27,7 +27,7 @@ from reachy_mini import ReachyMini
 from .asr import Qwen3ASR
 from .llm import LLMClient
 from .moves import MovementExecutor
-from .tts import Qwen3TTS
+from .tts import create_tts
 from .vad import VADStateMachine
 
 log = logging.getLogger(__name__)
@@ -349,7 +349,7 @@ def _tts_worker(
     audio_queue: queue.Queue,
 ) -> None:
     """Read sentences from tts_queue, synthesise audio, push to audio_queue."""
-    tts = Qwen3TTS()
+    tts = create_tts()
 
     while not stop_event.is_set():
         try:
